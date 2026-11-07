@@ -58,8 +58,8 @@ struct ClusterState {
     name: String,
     max_running: AtomicU64,
     running: AtomicU64,
-    admissions: AtomicU64, // <-- ДОДАНО
-    epoch: AtomicU64,      // <-- ДОДАНО: Захист від гонитви при релоадах
+    admissions: AtomicU64, // <-- added
+    epoch: AtomicU64,      // <-- added: Race condition safeguard during reloads
 }
 
 impl ClusterState {
@@ -68,8 +68,8 @@ impl ClusterState {
             name: config.name.clone(),
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
-            admissions: AtomicU64::new(0), // <-- ДОДАНО
-            epoch: AtomicU64::new(0),      // <-- ДОДАНО
+            admissions: AtomicU64::new(0), // <-- added
+            epoch: AtomicU64::new(0),      // <-- added
         }
     }
 
@@ -85,13 +85,13 @@ impl ClusterState {
         self.max_running().saturating_sub(self.running())
     }
 
-    // 1. ОПТИМІЗАЦІЯ АТОМАРНИХ ОПЕРАЦІЙ (lock xadd замість lock cmpxchg)
+    // 1. ATOMIC OPERATION OPTIMISATION (lock xadd instead of lock cmpxchg)
     fn try_increment(&self) -> bool {
-        // Миттєвий інкремент без циклів (найшвидша атомарна операція)
+        // Instantaneous increment without loops (the fastest atomic operation)
         let prev = self.running.fetch_add(1, Ordering::Relaxed);
 
         if prev >= self.max_running() {
-            // Rollback (відкат), якщо перевищили ліміт
+            // Rollback if the capacity limit is exceeded
             self.running.fetch_sub(1, Ordering::Relaxed);
             false
         } else {
@@ -165,7 +165,7 @@ impl ClusterPool {
         self.acquire_from_group(group_state)
     }
 
-    // Виносимо логіку вибору кластера (P2C) в окремий метод
+    // Extracting cluster selection logic (P2C) into a dedicated method
     fn acquire_from_group(&self, group: &GroupState) -> Result<Permit, AcquireError> {
         let len = group.clusters.len();
         if len == 0 {
@@ -211,7 +211,7 @@ impl ClusterPool {
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        // Клонуємо `Arc<GroupState>`, щоб не тримати `ArcSwapGuard` через `.await` (це заблокує оновлення конфіга)
+        // Cloning `Arc<GroupState>` to avoid holding `ArcSwapGuard` across `.await` points (which would block config updates)
         let group_state = {
             let guard = self.groups.load();
             guard
@@ -221,15 +221,15 @@ impl ClusterPool {
                 .ok_or(AcquireError::UnknownGroup)?
         };
 
-        // 1. Швидкий шлях: можливо, слот уже вільний
+        // 1. Fast path: a slot might already be available
         if let Ok(permit) = self.acquire_from_group(&group_state) {
             return Ok(permit);
         }
 
-        // 2. Стаємо в чергу
+        // 2. Enter the queue
         group_state.queued.fetch_add(1, Ordering::Relaxed);
 
-        // RAII Guard: гарантує, що лічильник зменшиться, навіть якщо Future буде скасовано (cancellation)
+        // RAII Guard: ensures the counter is decremented even if the Future is cancelled (cancellation safety)
         struct WaitGuard {
             queued: Arc<AtomicU64>,
         }
@@ -242,18 +242,18 @@ impl ClusterPool {
             queued: Arc::clone(&group_state.queued),
         };
 
-        // 3. Чекаємо з таймаутом
+        // 3. Wait with a timeout
         let wait_fut = tokio::time::timeout(wait, async {
             loop {
-                // ВАЖЛИВО: Отримуємо future `notified` ДО перевірки наявності слота.
-                // Це повністю унеможливлює стан гонитви (втрачене пробудження).
+                // CRUCIAL: Acquire the `notified` future BEFORE checking for slot availability.
+                // This entirely eliminates race conditions (lost wakeups).
                 let notified = group_state.notify.notified();
 
                 if let Ok(permit) = self.acquire_from_group(&group_state) {
                     return permit;
                 }
 
-                // Засинаємо, чекаючи на notify_one() від чийогось Permit::drop
+                // Sleep, awaiting a notify_one() from another caller's Permit::drop
                 notified.await;
             }
         });
@@ -281,8 +281,8 @@ impl ClusterPool {
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
     pub fn admissions(&self, group: &str, cluster: &str) -> u64 {
-        // Знаходимо кластер за допомогою існуючого методу find
-        // і читаємо атомарне значення без жодних локів (locks)
+        // Locate the cluster using the existing find method
+        // and read the atomic value without any locks
         self.find(group, cluster)
             .map(|c| c.admissions.load(Ordering::Relaxed))
             .unwrap_or(0)
@@ -294,17 +294,17 @@ impl ClusterPool {
         if let Some(state) = self.find(group, cluster) {
             let old = state.max_running.swap(max_running, Ordering::Relaxed);
 
-            // НОВЕ: Інвалідуємо фонові reconcile, бо місткість змінилася
+            // NEW: Invalidate background reconciliations since capacity has mutated
             state.epoch.fetch_add(1, Ordering::Relaxed);
 
-            // Якщо місткість збільшилася, нам треба розбудити тих, хто висить у черзі!
+            // If capacity has expanded, we must awaken those waiting in the queue!
             if max_running > old {
                 let guard = self.groups.load();
                 if let Some(g) = guard.iter().find(|g| g.name == group) {
-                    // Використовуємо notify_waiters() замість notify_one().
-                    // Адже місткість могла зрости на 10, і якщо ми збудимо лише одного,
-                    // інші 9 слотів будуть простоювати. Ті, кому слота все одно не вистачить,
-                    // просто зроблять спробу і заснуть назад.
+                    // Utilising notify_waiters() instead of notify_one().
+                    // After all, capacity might have increased by 10, and if we awaken only one,
+                    // the other 9 slots would sit idle. Those who still lack a slot
+                    // will simply re-attempt and go back to sleep.
                     g.notify.notify_waiters();
                 }
             }
@@ -316,7 +316,7 @@ impl ClusterPool {
     pub fn reload(&self, config: PoolConfig) {
         let old_guard = self.groups.load();
 
-        // 1. Збираємо старі групи для перевикористання
+        // 1. Gather legacy groups for reuse
         let mut existing_groups = std::collections::HashMap::new();
         for g in old_guard.iter() {
             existing_groups.insert(g.name.clone(), Arc::clone(g));
@@ -338,18 +338,18 @@ impl ClusterPool {
 
             let mut states = Vec::new();
             for c in clusters {
-                // ФІКС INC-6: Перевикористовуємо існуючий стан!
-                // Це зберігає running та admissions лічильники.
+                // FIX INC-6: Reuse the existing state!
+                // This preserves the running and admissions counters.
                 if let Some(old_c) = old_clusters.remove(&c.name) {
                     old_c.max_running.store(c.max_running, Ordering::Relaxed);
-                    old_c.epoch.fetch_add(1, Ordering::Relaxed); // Інвалідуємо старі reconcile
+                    old_c.epoch.fetch_add(1, Ordering::Relaxed); // Invalidate legacy reconciliations
                     states.push(old_c);
                 } else {
                     states.push(Arc::new(ClusterState::new(c)));
                 }
             }
 
-            // Будимо всю чергу, щоб вони побачили нову місткість
+            // Awaken the entire queue so they can observe the new capacity
             notify.notify_waiters();
 
             new_groups.push(Arc::new(GroupState {
@@ -370,25 +370,25 @@ impl ClusterPool {
         Fut: Future<Output = u64>,
     {
         if let Some(state) = self.find(group, cluster) {
-            // 1. Запам'ятовуємо стан і епоху ДО асинхронного запиту
+            // 1. Snapshot the state and epoch BEFORE the asynchronous request
             let baseline = state.running.load(Ordering::Relaxed);
             let start_epoch = state.epoch.load(Ordering::Relaxed);
 
-            // 2. Довге очікування відповіді від рушія
+            // 2. Lengthy wait for the engine's response
             let target = fetch().await;
 
-            // 3. Захист (Epoch Pattern): Якщо адмін робив reload або змінював ліміти,
-            // поки ми чекали, дані від рушія вже нерелевантні. Скасовуємо.
+            // 3. Safeguard (Epoch Pattern): If an admin executed a reload or altered limits,
+            // whilst we were waiting, the engine data is no longer relevant. Abort.
             if state.epoch.load(Ordering::Relaxed) != start_epoch {
                 return;
             }
 
-            // 4. ФІКС INC-5: Компенсуюча транзакція (Drift correction)
+            // 4. FIX INC-5: Compensating transaction (Drift correction)
             let _ = state
                 .running
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     let drift = target as i64 - baseline as i64;
-                    // .max(0) захищає від underflow, якщо завершилося більше запитів, ніж очікувалося
+                    // .max(0) safeguards against underflow if more queries completed than anticipated
                     Some((current as i64 + drift).max(0) as u64)
                 });
         }
@@ -404,10 +404,10 @@ pub struct Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Звільняємо слот
+        // Release the slot
         self.state.decrement();
 
-        // Якщо в черзі є очікувачі, миттєво будимо одного з них
+        // If there are waiters in the queue, instantly awaken one of them
         if self.group_queued.load(Ordering::Relaxed) > 0 {
             self.group_notify.notify_one();
         }

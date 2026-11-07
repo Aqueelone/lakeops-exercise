@@ -1,9 +1,12 @@
+use admission::{AcquireError, ClusterConfig, ClusterPool, PoolConfig};
 use std::sync::Arc;
 use std::time::Duration;
-use admission::{AcquireError, ClusterConfig, ClusterPool, PoolConfig};
 
 fn pool(max_running: u64) -> Arc<ClusterPool> {
-    ClusterPool::new(PoolConfig::default().group("analytics", vec![ClusterConfig::new("trino-1", max_running)]))
+    ClusterPool::new(PoolConfig::default().group(
+        "analytics",
+        vec![ClusterConfig::new("trino-1", max_running)],
+    ))
 }
 
 #[tokio::test]
@@ -19,12 +22,14 @@ async fn test_inc_5_reconcile_drifts_under_load() {
     let pool_clone = Arc::clone(&pool);
 
     let reconcile_task = tokio::spawn(async move {
-        pool_clone.reconcile("analytics", "trino-1", || async {
-            // Сигналізуємо основному потоку, що fetch почався (тобто baseline = 2 вже прочитано!)
-            let _ = tx.send(());
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            2
-        }).await;
+        pool_clone
+            .reconcile("analytics", "trino-1", || async {
+                // Сигналізуємо основному потоку, що fetch почався (тобто baseline = 2 вже прочитано!)
+                let _ = tx.send(());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                2
+            })
+            .await;
     });
 
     // Чекаємо, поки reconcile ТОЧНО прочитає baseline
@@ -58,10 +63,8 @@ async fn test_inc_6_reload_resets_counters() {
     assert_eq!(pool.admissions("analytics", "trino-1"), 2);
 
     // Перезавантажуємо конфіг, залишаючи строго trino-1, щоб загальна місткість групи залишилась 10
-    let new_config = PoolConfig::default()
-        .group("analytics", vec![
-            ClusterConfig::new("trino-1", 10),
-        ]);
+    let new_config =
+        PoolConfig::default().group("analytics", vec![ClusterConfig::new("trino-1", 10)]);
     pool.reload(new_config);
 
     assert_eq!(
