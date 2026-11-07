@@ -1,10 +1,13 @@
+use admission::{ClusterConfig, ClusterPool, PoolConfig};
 use std::sync::Arc;
 use std::time::Duration;
-use admission::{ClusterConfig, ClusterPool, PoolConfig};
 use tokio::time::Instant;
 
 fn pool(max_running: u64) -> Arc<ClusterPool> {
-    ClusterPool::new(PoolConfig::default().group("analytics", vec![ClusterConfig::new("trino-1", max_running)]))
+    ClusterPool::new(PoolConfig::default().group(
+        "analytics",
+        vec![ClusterConfig::new("trino-1", max_running)],
+    ))
 }
 
 #[tokio::test]
@@ -16,7 +19,9 @@ async fn edge_case_cancellation_storm_maintains_metrics() {
     for _ in 0..1000 {
         let p = Arc::clone(&pool);
         tasks.push(tokio::spawn(async move {
-            let _ = p.acquire_timeout("analytics", Duration::from_secs(60)).await;
+            let _ = p
+                .acquire_timeout("analytics", Duration::from_secs(60))
+                .await;
         }));
     }
 
@@ -25,15 +30,19 @@ async fn edge_case_cancellation_storm_maintains_metrics() {
     assert_eq!(pool.queued("analytics"), 1000);
 
     // Влаштовуємо Cancellation Storm: жорстко вбиваємо половину задач
-    for i in 0..500 {
-        tasks[i].abort();
+    for task in tasks.iter().take(500) {
+        task.abort();
     }
 
     // Чекаємо, поки Drop для WaitGuard відпрацює
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Перевіряємо, що lock-free лічильник ідеально зійшовся
-    assert_eq!(pool.queued("analytics"), 500, "Лічильник черги зламався після масового скасування");
+    assert_eq!(
+        pool.queued("analytics"),
+        500,
+        "Лічильник черги зламався після масового скасування"
+    );
 }
 
 #[tokio::test]
@@ -43,14 +52,17 @@ async fn edge_case_reload_preserves_waiting_clients() {
 
     let p_clone = Arc::clone(&pool);
     let waiter = tokio::spawn(async move {
-        p_clone.acquire_timeout("analytics", Duration::from_secs(5)).await
+        p_clone
+            .acquire_timeout("analytics", Duration::from_secs(5))
+            .await
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(pool.queued("analytics"), 1);
 
     // Адмін робить гаряче перезавантаження конфігурації!
-    let new_config = PoolConfig::default().group("analytics", vec![ClusterConfig::new("trino-1", 1)]);
+    let new_config =
+        PoolConfig::default().group("analytics", vec![ClusterConfig::new("trino-1", 1)]);
     pool.reload(new_config);
 
     // Переконуємось, що черга не загубилась при підміні ArcSwap
@@ -60,7 +72,10 @@ async fn edge_case_reload_preserves_waiting_clients() {
     _held.release();
 
     // Клієнт має успішно прокинутись і забрати слот, незважаючи на те, що конфіг змінився
-    let permit = waiter.await.unwrap().expect("Клієнт відвалився по таймауту замість пробудження!");
+    let permit = waiter
+        .await
+        .unwrap()
+        .expect("Клієнт відвалився по таймауту замість пробудження!");
     assert_eq!(permit.cluster(), "trino-1");
 }
 
@@ -71,7 +86,9 @@ async fn edge_case_dynamic_capacity_increase_wakes_waiters() {
     let p_clone = Arc::clone(&pool);
     let waiter = tokio::spawn(async move {
         // Клієнт готовий чекати 5 секунд
-        p_clone.acquire_timeout("analytics", Duration::from_secs(5)).await
+        p_clone
+            .acquire_timeout("analytics", Duration::from_secs(5))
+            .await
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -86,6 +103,12 @@ async fn edge_case_dynamic_capacity_increase_wakes_waiters() {
     // всередину set_max_running та reload!
 
     let result = waiter.await.unwrap();
-    assert!(result.is_ok(), "Клієнт не прокинувся після збільшення місткості!");
-    assert!(start.elapsed() < Duration::from_millis(100), "Клієнт чекав занадто довго!");
+    assert!(
+        result.is_ok(),
+        "Клієнт не прокинувся після збільшення місткості!"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "Клієнт чекав занадто довго!"
+    );
 }

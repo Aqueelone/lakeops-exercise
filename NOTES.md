@@ -73,7 +73,15 @@ Strictly **zero network I/O and zero latency overhead**. The hot path remains en
 **What I would deliberately NOT build:**
 I would deliberately **not build a synchronous centralized state store** (e.g., Redis with Lua scripts, Memcached, etcd, or ZooKeeper locks) on the per-query hot path. Forcing every admission request to incur a network hop would instantly destroy our microsecond latencies, introduce a massive single point of failure (SPOF), and bottleneck the entire gateway under high concurrency. I would also avoid building peer-to-peer Gossip protocols, as they are overly complex for a simple gateway routing layer and suffer from eventual consistency edge cases during traffic spikes.
 
-## Bonus: INC-5 and INC-6
+## Part 5: Incidents & Bug Fixes
+
+### INC-5: Reconcile Drift Under Load
+* **Root Cause:** The original `reconcile` implementation performed a blind overwrite (`store`) using the fetched `target` value. Because `fetch().await` is a slow asynchronous operation, any queries admitted or released concurrently during this await point were permanently lost, corrupting the gateway's internal `running` counter. Furthermore, if a cluster's capacity was reloaded during the fetch, the reconciliation would incorrectly apply stale data.
+* **Solution:** I implemented a **Compensating Transaction** pattern coupled with an **Epoch Generation Counter**. Before the async fetch, `reconcile` captures the current `running` count (`baseline`) and the current `epoch`. After the fetch, it verifies the `epoch` hasn't mutated (which would indicate a configuration reload or administrative capacity change). If the epoch is valid, it calculates the `drift` (`target - baseline`) and atomically applies this differential using `fetch_update`. This guarantees zero lost updates from parallel traffic on the Data Plane.
+
+### INC-6: Counter Reset During Config Reloads
+* **Root Cause:** The `reload` method blindly iterated through the new configuration, invoking `ClusterState::new()` for every cluster. This forcibly instantiated new atomic counters initialised to zero, instantly wiping out historical Prometheus metrics (`admissions`) and artificially releasing all backpressure. This resulted in immediate traffic spikes as the gateway "forgot" about currently executing queries.
+* **Solution:** I refactored the `reload` method to perform **State Inheritance**. It now extracts existing `Arc<ClusterState>` instances from the previous configuration snapshot. If a cluster persists across reloads, the gateway reuses the existing memory allocation, cleanly preserving all `running` and `admissions` counts. It solely updates the `max_running` atomic and increments the `epoch` to safely abort any stale background reconciliations. Finally, it invokes `notify_waiters()` to awaken any queued clients, allowing them to instantly utilise newly added capacity.
 
 ## Before shipping, I would still want
 

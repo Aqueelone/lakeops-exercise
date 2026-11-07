@@ -9,12 +9,12 @@
 //! See README.md for the tasks.
 
 use arc_swap::ArcSwap;
-use tokio::sync::Notify;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
@@ -59,6 +59,7 @@ struct ClusterState {
     max_running: AtomicU64,
     running: AtomicU64,
     admissions: AtomicU64, // <-- ДОДАНО
+    epoch: AtomicU64,      // <-- ДОДАНО: Захист від гонитви при релоадах
 }
 
 impl ClusterState {
@@ -68,6 +69,7 @@ impl ClusterState {
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
             admissions: AtomicU64::new(0), // <-- ДОДАНО
+            epoch: AtomicU64::new(0),      // <-- ДОДАНО
         }
     }
 
@@ -127,7 +129,10 @@ impl ClusterPool {
     pub fn new(config: PoolConfig) -> Arc<Self> {
         let mut initial = Vec::new();
         for (name, clusters) in &config.groups {
-            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
+            let states = clusters
+                .iter()
+                .map(|c| Arc::new(ClusterState::new(c)))
+                .collect();
             initial.push(Arc::new(GroupState {
                 name: name.clone(),
                 clusters: states,
@@ -153,7 +158,10 @@ impl ClusterPool {
 
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
         let guard = self.groups.load();
-        let group_state = guard.iter().find(|g| g.name == group).ok_or(AcquireError::UnknownGroup)?;
+        let group_state = guard
+            .iter()
+            .find(|g| g.name == group)
+            .ok_or(AcquireError::UnknownGroup)?;
         self.acquire_from_group(group_state)
     }
 
@@ -175,7 +183,11 @@ impl ClusterPool {
                 }
                 let a = &group.clusters[i];
                 let b = &group.clusters[j];
-                if a.available() >= b.available() { a } else { b }
+                if a.available() >= b.available() {
+                    a
+                } else {
+                    b
+                }
             };
 
             if state.available() == 0 {
@@ -202,7 +214,11 @@ impl ClusterPool {
         // Клонуємо `Arc<GroupState>`, щоб не тримати `ArcSwapGuard` через `.await` (це заблокує оновлення конфіга)
         let group_state = {
             let guard = self.groups.load();
-            guard.iter().find(|g| g.name == group).cloned().ok_or(AcquireError::UnknownGroup)?
+            guard
+                .iter()
+                .find(|g| g.name == group)
+                .cloned()
+                .ok_or(AcquireError::UnknownGroup)?
         };
 
         // 1. Швидкий шлях: можливо, слот уже вільний
@@ -278,6 +294,9 @@ impl ClusterPool {
         if let Some(state) = self.find(group, cluster) {
             let old = state.max_running.swap(max_running, Ordering::Relaxed);
 
+            // НОВЕ: Інвалідуємо фонові reconcile, бо місткість змінилася
+            state.epoch.fetch_add(1, Ordering::Relaxed);
+
             // Якщо місткість збільшилася, нам треба розбудити тих, хто висить у черзі!
             if max_running > old {
                 let guard = self.groups.load();
@@ -297,20 +316,40 @@ impl ClusterPool {
     pub fn reload(&self, config: PoolConfig) {
         let old_guard = self.groups.load();
 
-        let mut existing = std::collections::HashMap::new();
+        // 1. Збираємо старі групи для перевикористання
+        let mut existing_groups = std::collections::HashMap::new();
         for g in old_guard.iter() {
-            existing.insert(g.name.clone(), (Arc::clone(&g.notify), Arc::clone(&g.queued)));
+            existing_groups.insert(g.name.clone(), Arc::clone(g));
         }
 
         let mut new_groups = Vec::new();
         for (name, clusters) in &config.groups {
-            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
-            let (notify, queued) = existing.remove(name).unwrap_or_else(|| {
-                (Arc::new(Notify::new()), Arc::new(AtomicU64::new(0)))
-            });
+            let old_group = existing_groups.remove(name);
 
-            // Оскільки конфіг змінився (можливо, додалися нові кластери або слоти),
-            // про всяк випадок будимо всю чергу, щоб вони побачили нову місткість.
+            let mut old_clusters = std::collections::HashMap::new();
+            let (notify, queued) = if let Some(g) = &old_group {
+                for c in &g.clusters {
+                    old_clusters.insert(c.name.clone(), Arc::clone(c));
+                }
+                (Arc::clone(&g.notify), Arc::clone(&g.queued))
+            } else {
+                (Arc::new(Notify::new()), Arc::new(AtomicU64::new(0)))
+            };
+
+            let mut states = Vec::new();
+            for c in clusters {
+                // ФІКС INC-6: Перевикористовуємо існуючий стан!
+                // Це зберігає running та admissions лічильники.
+                if let Some(old_c) = old_clusters.remove(&c.name) {
+                    old_c.max_running.store(c.max_running, Ordering::Relaxed);
+                    old_c.epoch.fetch_add(1, Ordering::Relaxed); // Інвалідуємо старі reconcile
+                    states.push(old_c);
+                } else {
+                    states.push(Arc::new(ClusterState::new(c)));
+                }
+            }
+
+            // Будимо всю чергу, щоб вони побачили нову місткість
             notify.notify_waiters();
 
             new_groups.push(Arc::new(GroupState {
@@ -330,9 +369,28 @@ impl ClusterPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = u64>,
     {
-        let target = fetch().await;
         if let Some(state) = self.find(group, cluster) {
-            state.running.store(target, Ordering::Relaxed);
+            // 1. Запам'ятовуємо стан і епоху ДО асинхронного запиту
+            let baseline = state.running.load(Ordering::Relaxed);
+            let start_epoch = state.epoch.load(Ordering::Relaxed);
+
+            // 2. Довге очікування відповіді від рушія
+            let target = fetch().await;
+
+            // 3. Захист (Epoch Pattern): Якщо адмін робив reload або змінював ліміти,
+            // поки ми чекали, дані від рушія вже нерелевантні. Скасовуємо.
+            if state.epoch.load(Ordering::Relaxed) != start_epoch {
+                return;
+            }
+
+            // 4. ФІКС INC-5: Компенсуюча транзакція (Drift correction)
+            let _ = state
+                .running
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    let drift = target as i64 - baseline as i64;
+                    // .max(0) захищає від underflow, якщо завершилося більше запитів, ніж очікувалося
+                    Some((current as i64 + drift).max(0) as u64)
+                });
         }
     }
 }
