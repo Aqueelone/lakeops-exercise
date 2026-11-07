@@ -56,7 +56,22 @@ This custom test suite uncovered a subtle but critical architectural flaw inhere
 * **The Problem:** If a cluster has zero capacity (or is completely saturated), callers correctly queue up in `acquire_timeout`. However, if an administrator dynamically increases the limit via `set_max_running()` or injects a larger configuration via `reload()`, the waiting clients remain asleep indefinitely until their timeouts expire. This occurs because no active queries exist to drop a `Permit` and trigger a `release()` wakeup.
 * **The Solution:** I resolved this by modifying the administrative APIs. In `set_max_running`, the system now performs an atomic `swap` to compare the old capacity against the new one. If the capacity has expanded, it explicitly accesses the group's state and invokes `notify_waiters()`. I applied a similar proactive wakeup strategy to `reload()`. This safely awakens all queued clients, allowing them to instantly re-evaluate the newly available slots, passing the strict edge-case tests and eliminating the risk of stalled traffic.
 
-## Part 4: Global admission across 6 pods
+## Part 4: Design (Distributed Capacity Enforcement)
+
+**Design: Dynamic Local Quota Partitioning**
+Rather than sharing state per-query, I would partition the global limit across the active gateway pods. A lightweight background control plane (e.g., a Tokio task watching Kubernetes Endpoints or a service mesh registry) monitors the number of healthy pods. It divides the global `max_running` by the pod count (e.g., 40 global / 6 pods ≈ 6 per pod) and updates the local limit using our existing `set_max_running()` API. Since the Load Balancer distributes traffic roughly evenly, this mathematically enforces the global cap.
+
+**Cost on the Hot Path:**
+Strictly **zero network I/O and zero latency overhead**. The hot path remains entirely local, lock-free, and CPU-bound, preserving our extreme ~26+ Melem/s throughput. Queries do not wait on network round-trips to a central datastore.
+
+**Failure Modes:**
+* **When a pod dies holding slots:** The queries executing on those slots die with the pod. The pod's allocated fraction of the quota is temporarily unavailable. Once the control plane detects the pod failure (via failed health checks), it recalculates and redistributes the full global capacity across the surviving 5 pods (e.g., 40 / 5 = 8 slots each), automatically recovering the system's total capacity.
+* **When the network partitions:**
+    * If a pod is partitioned from the Load Balancer, it receives no traffic, stranding its local quota.
+    * If a pod is partitioned from the control plane but still serves client traffic, it gracefully degrades to a "fail-static" state, continuing to enforce its last known local quota. This guarantees we never breach the global capacity cap of the downstream engine, even in a split-brain scenario.
+
+**What I would deliberately NOT build:**
+I would deliberately **not build a synchronous centralized state store** (e.g., Redis with Lua scripts, Memcached, etcd, or ZooKeeper locks) on the per-query hot path. Forcing every admission request to incur a network hop would instantly destroy our microsecond latencies, introduce a massive single point of failure (SPOF), and bottleneck the entire gateway under high concurrency. I would also avoid building peer-to-peer Gossip protocols, as they are overly complex for a simple gateway routing layer and suffer from eventual consistency edge cases during traffic spikes.
 
 ## Bonus: INC-5 and INC-6
 
