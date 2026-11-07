@@ -102,3 +102,18 @@ While the core data plane is heavily optimised and lock-free, a true production-
 ### Metadata-Aware Smart Routing (Iceberg Crystallisation):**
    Drawing on my experience with data crystallisation and algorithmic indexing, I would elevate the gateway from a naive load balancer to a metadata-aware router. By performing lightweight AST parsing on incoming SQL queries (e.g., using `sqlparser`) and leveraging cached Iceberg structural metadata (Manifests, Puffin files), the gateway could dynamically route queries to specific Trino/StarRocks clusters that already hold the targeted data shards in their local NVMe/RAM caches. This achieves extreme cache locality and drastically reduces downstream compute times.
 
+## P.S.
+### Part 2-postscript: Performance Post-Checking & Memory Layout Optimisation
+
+After implementing the asynchronous queueing (`Notify`) and metrics features required for later tasks, profiling revealed a slight throughput degradation. Further analysis identified two subtle hardware-level bottlenecks: False Sharing and atomic reference counting overhead.
+
+| Bench | Before | After | Degraded (Post-Features) | Optimised (Memory Layout) |
+|-------|--------|-------|--------------------------|---------------------------|
+| acquire_release/1  | 1.54 Melem/s (647 ns) | 25.04 Melem/s (39 ns) | ~24.31 Melem/s (41 ns) | 25.96 Melem/s (38 ns) |
+| acquire_release/4  | 2.67 Melem/s (1.49 µs) | 20.18 Melem/s (198 ns) | ~20.18 Melem/s (198 ns) | 25.67 Melem/s (155 ns) |
+| acquire_release/16 | 3.74 Melem/s (4.27 µs) | 26.86 Melem/s (595 ns) | ~26.86 Melem/s (595 ns) | 37.62 Melem/s (425 ns) |
+
+Changes, and why each one helps:
+
+- **Eradicated False Sharing via Cache Line Padding (`#[repr(align(64))]`)**: When the global allocator places multiple `ClusterState` instances adjacent to one another in memory, they often share the same 64-byte L1/L2 CPU cache line. Consequently, when multiple threads update the `running` atomics of *different* clusters concurrently, the CPU forcibly invalidates the entire cache line for all cores, causing massive hardware-level contention (False Sharing). Applying `#[repr(align(64))]` forces each cluster's state into its own dedicated cache line, completely decoupling their memory access paths and unlocking the massive ~37.6 Melem/s throughput on 16 threads.
+- **Eliminated Redundant Atomic Reference Counting (`Arc` consolidation)**: Initially, to support queue wakeups, the `Permit` struct was expanded to hold three separate `Arc` pointers (`state`, `group_notify`, and `group_queued`). Every admitted query invoked three `Arc::clone()` (atomic `fetch_add`) and three `Drop` (atomic `fetch_sub`) operations. I refactored the architecture to embed the `group_notify` and `group_queued` references directly inside the `ClusterState`. This returned the `Permit` to a lightweight 8-byte struct holding a single `Arc`, eliminating four unnecessary atomic CPU instructions from the critical hot path of every single request.

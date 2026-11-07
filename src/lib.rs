@@ -54,22 +54,28 @@ pub enum AcquireError {
 }
 
 #[derive(Debug)]
+#[repr(align(64))] // OPTIMIZATION: Eliminating False Sharing Between Threads at the L1 Cache Level
 struct ClusterState {
     name: String,
     max_running: AtomicU64,
     running: AtomicU64,
     admissions: AtomicU64, // <-- added
     epoch: AtomicU64,      // <-- added: Race condition safeguard during reloads
+    // OPTIMIZATION: Keep the reference here to avoid cloning unnecessary Arcs in Permit.
+    group_notify: Arc<Notify>,
+    group_queued: Arc<AtomicU64>,
 }
 
 impl ClusterState {
-    fn new(config: &ClusterConfig) -> Self {
+    fn new(config: &ClusterConfig, group_notify: Arc<Notify>, group_queued: Arc<AtomicU64>) -> Self {
         Self {
             name: config.name.clone(),
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
-            admissions: AtomicU64::new(0), // <-- added
-            epoch: AtomicU64::new(0),      // <-- added
+            admissions: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            group_notify,
+            group_queued,
         }
     }
 
@@ -129,15 +135,21 @@ impl ClusterPool {
     pub fn new(config: PoolConfig) -> Arc<Self> {
         let mut initial = Vec::new();
         for (name, clusters) in &config.groups {
+            // We create them here once for the group
+            let notify = Arc::new(Notify::new());
+            let queued = Arc::new(AtomicU64::new(0));
+
             let states = clusters
                 .iter()
-                .map(|c| Arc::new(ClusterState::new(c)))
+                // We pass the link to each cluster
+                .map(|c| Arc::new(ClusterState::new(c, Arc::clone(&notify), Arc::clone(&queued))))
                 .collect();
+
             initial.push(Arc::new(GroupState {
                 name: name.clone(),
                 clusters: states,
-                notify: Arc::new(Notify::new()),
-                queued: Arc::new(AtomicU64::new(0)),
+                notify,
+                queued,
             }));
         }
         Arc::new(Self {
@@ -197,9 +209,7 @@ impl ClusterPool {
             if state.try_increment() {
                 state.admissions.fetch_add(1, Ordering::Relaxed);
                 return Ok(Permit {
-                    state: Arc::clone(state),
-                    group_notify: Arc::clone(&group.notify),
-                    group_queued: Arc::clone(&group.queued),
+                    state: Arc::clone(state), // Just only ones Arc::clone!
                 });
             }
         }
@@ -338,14 +348,14 @@ impl ClusterPool {
 
             let mut states = Vec::new();
             for c in clusters {
-                // FIX INC-6: Reuse the existing state!
-                // This preserves the running and admissions counters.
+                // FIX INC-6: Reuse existing state!
                 if let Some(old_c) = old_clusters.remove(&c.name) {
                     old_c.max_running.store(c.max_running, Ordering::Relaxed);
-                    old_c.epoch.fetch_add(1, Ordering::Relaxed); // Invalidate legacy reconciliations
+                    old_c.epoch.fetch_add(1, Ordering::Relaxed);
                     states.push(old_c);
                 } else {
-                    states.push(Arc::new(ClusterState::new(c)));
+                    // If the cluster is new, we create it with existing notify/queued groups
+                    states.push(Arc::new(ClusterState::new(c, Arc::clone(&notify), Arc::clone(&queued))));
                 }
             }
 
@@ -398,18 +408,17 @@ impl ClusterPool {
 /// Proof of admission. The holder may run one query on `cluster()`.
 pub struct Permit {
     state: Arc<ClusterState>,
-    group_notify: Arc<Notify>,
-    group_queued: Arc<AtomicU64>,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Release the slot
+        // A slot releasing
         self.state.decrement();
 
-        // If there are waiters in the queue, instantly awaken one of them
-        if self.group_queued.load(Ordering::Relaxed) > 0 {
-            self.group_notify.notify_one();
+        // If there are waiters in the queue, we immediately wake one of them up.
+        // We take the reference directly from the cluster state itself!
+        if self.state.group_queued.load(Ordering::Relaxed) > 0 {
+            self.state.group_notify.notify_one();
         }
     }
 }
