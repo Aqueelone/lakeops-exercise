@@ -85,4 +85,20 @@ I would deliberately **not build a synchronous centralized state store** (e.g., 
 
 ## Before shipping, I would still want
 
--
+While the core data plane is heavily optimised and lock-free, a true production-grade gateway requires additional scaffolding before handling live traffic:
+
+### Formal Concurrency Verification (`loom`):
+   Relying on `Ordering::Relaxed` in custom lock-free algorithms can occasionally mask subtle CPU reordering bugs (e.g., lost updates on ARM architectures). I would implement `loom` tests to exhaustively model-check the atomic operations and memory barriers across all possible thread interleavings.
+### Deep Apache Iceberg Integration (Control & Audit Plane):
+   While the hot path must remain strictly in-memory, I would leverage Apache Iceberg for the cold path:
+* **Telemetry Lake:** Instead of exposing only raw Prometheus counters, the gateway could asynchronously batch and flush rich admission events (`Admitted`, `Queued`, `Rejected`) into an Iceberg audit table, enabling deep traffic analytics via Trino.
+* **Distributed Config Management:** Rather than manually pushing reloads via an API, `PoolConfig` and tenant quotas could be stored as an Iceberg table. The gateway would monitor for new snapshot IDs and trigger a lock-free `reload` automatically upon detecting a new commit.
+### Graceful Shutdown & Draining:
+   The implementation currently lacks a mechanism to drain the gateway. I would introduce a shutdown token that stops accepting new queries in `try_acquire` and waits for all actively held `Permit` instances to be dropped (or timeout) before letting the Tokio runtime exit. This is vital for zero-downtime Kubernetes deployments.
+### Multi-Tenant Fairness (QoS):
+   The `notify_waiters()` approach wakes up all waiting tasks (a thundering herd). While highly performant, it is fundamentally FIFO/random. To prevent a "noisy neighbour" from monopolising the queue, I would introduce token-bucket rate limiting or QoS tiers per tenant *before* they enter the cluster queue.
+### Hot/Cold Path Segregation (Two-Tier Architecture):
+   While the initial admission check is on the ultra-hot path, the wait state inside `acquire_timeout` and the lifecycle of long-running ETL queries are fundamentally "cold". For heavy batch workloads, I would architect a two-tier system: keeping the interactive gateway strictly in-memory for low-latency dashboards, whilst offloading the queue for heavy jobs to a persistent distributed message broker (e.g., Kafka or an Iceberg-backed log). This prevents memory saturation on the gateway pods during massive queue build-ups.
+### Metadata-Aware Smart Routing (Iceberg Crystallisation):**
+   Drawing on my experience with data crystallisation and algorithmic indexing, I would elevate the gateway from a naive load balancer to a metadata-aware router. By performing lightweight AST parsing on incoming SQL queries (e.g., using `sqlparser`) and leveraging cached Iceberg structural metadata (Manifests, Puffin files), the gateway could dynamically route queries to specific Trino/StarRocks clusters that already hold the targeted data shards in their local NVMe/RAM caches. This achieves extreme cache locality and drastically reduces downstream compute times.
+
