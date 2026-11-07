@@ -7,13 +7,15 @@ use std::sync::Arc;
 use admission::{AcquireError, ClusterConfig, ClusterPool, PoolConfig};
 
 fn pool(clusters: &[(&str, u64)]) -> Arc<ClusterPool> {
-    ClusterPool::new(PoolConfig::default().group(
-        "g",
-        clusters
-            .iter()
-            .map(|(name, max)| ClusterConfig::new(*name, *max))
-            .collect(),
-    ))
+    ClusterPool::new(
+        PoolConfig::default().group(
+            "g",
+            clusters
+                .iter()
+                .map(|(name, max)| ClusterConfig::new(*name, *max))
+                .collect(),
+        ),
+    )
 }
 
 #[test]
@@ -26,7 +28,10 @@ fn permit_can_cross_threads() {
 #[test]
 fn unknown_group() {
     let pool = pool(&[("a", 1)]);
-    assert_eq!(pool.try_acquire("nope").err(), Some(AcquireError::UnknownGroup));
+    assert_eq!(
+        pool.try_acquire("nope").err(),
+        Some(AcquireError::UnknownGroup)
+    );
 }
 
 #[test]

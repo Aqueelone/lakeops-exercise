@@ -24,32 +24,36 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("acquire_release");
     for threads in [1usize, 4, 16] {
         group.throughput(Throughput::Elements(threads as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
-            let pool = pool();
-            b.iter_custom(|iters| {
-                let barrier = Barrier::new(threads + 1);
-                thread::scope(|s| {
-                    let workers: Vec<_> = (0..threads)
-                        .map(|_| {
-                            s.spawn(|| {
-                                barrier.wait();
-                                for _ in 0..iters {
-                                    if let Ok(permit) = pool.try_acquire("analytics") {
-                                        permit.release();
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &threads| {
+                let pool = pool();
+                b.iter_custom(|iters| {
+                    let barrier = Barrier::new(threads + 1);
+                    thread::scope(|s| {
+                        let workers: Vec<_> = (0..threads)
+                            .map(|_| {
+                                s.spawn(|| {
+                                    barrier.wait();
+                                    for _ in 0..iters {
+                                        if let Ok(permit) = pool.try_acquire("analytics") {
+                                            permit.release();
+                                        }
                                     }
-                                }
+                                })
                             })
-                        })
-                        .collect();
-                    barrier.wait();
-                    let start = Instant::now();
-                    for w in workers {
-                        w.join().unwrap();
-                    }
-                    start.elapsed()
-                })
-            });
-        });
+                            .collect();
+                        barrier.wait();
+                        let start = Instant::now();
+                        for w in workers {
+                            w.join().unwrap();
+                        }
+                        start.elapsed()
+                    })
+                });
+            },
+        );
     }
     group.finish();
 }

@@ -19,7 +19,10 @@ async fn wait_until(what: &str, cond: impl Fn() -> bool) {
 async fn free_slot_is_returned_immediately() {
     let pool = pool(1);
     let start = Instant::now();
-    let permit = pool.acquire_timeout("g", Duration::from_secs(5)).await.unwrap();
+    let permit = pool
+        .acquire_timeout("g", Duration::from_secs(5))
+        .await
+        .unwrap();
     assert!(start.elapsed() < Duration::from_millis(50));
     assert_eq!(permit.cluster(), "a");
 }
@@ -28,7 +31,10 @@ async fn free_slot_is_returned_immediately() {
 async fn unknown_group_fails_without_waiting() {
     let pool = pool(1);
     let start = Instant::now();
-    let err = pool.acquire_timeout("nope", Duration::from_secs(5)).await.err();
+    let err = pool
+        .acquire_timeout("nope", Duration::from_secs(5))
+        .await
+        .err();
     assert_eq!(err, Some(AcquireError::UnknownGroup));
     assert!(start.elapsed() < Duration::from_millis(50));
 }
@@ -47,7 +53,10 @@ async fn waiter_gets_the_slot_when_it_is_released() {
     let released_at = Instant::now();
     held.release();
     let permit = waiter.await.unwrap().unwrap();
-    assert!(released_at.elapsed() < Duration::from_millis(100), "waiter was not woken promptly");
+    assert!(
+        released_at.elapsed() < Duration::from_millis(100),
+        "waiter was not woken promptly"
+    );
     assert_eq!(permit.cluster(), "a");
     assert_eq!(pool.queued("g"), 0);
 }
@@ -58,7 +67,10 @@ async fn waiter_times_out() {
     let _held = pool.try_acquire("g").unwrap();
 
     let start = Instant::now();
-    let err = pool.acquire_timeout("g", Duration::from_millis(50)).await.err();
+    let err = pool
+        .acquire_timeout("g", Duration::from_millis(50))
+        .await
+        .err();
     assert_eq!(err, Some(AcquireError::Timeout));
     assert!(start.elapsed() >= Duration::from_millis(50));
     assert!(start.elapsed() < Duration::from_millis(500));

@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+fastrand = "2.5.0"
+arc-swap = "1.9.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
