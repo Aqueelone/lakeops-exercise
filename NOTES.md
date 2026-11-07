@@ -109,9 +109,9 @@ After implementing the asynchronous queueing (`Notify`) and metrics features req
 
 | Bench | Before | After | Degraded (Post-Features) | Optimised (Memory Layout) |
 |-------|--------|-------|--------------------------|---------------------------|
-| acquire_release/1  | 1.54 Melem/s (647 ns) | 25.04 Melem/s (39 ns) | ~24.31 Melem/s (41 ns) | 25.96 Melem/s (38 ns) |
-| acquire_release/4  | 2.67 Melem/s (1.49 µs) | 20.18 Melem/s (198 ns) | ~20.18 Melem/s (198 ns) | 25.67 Melem/s (155 ns) |
-| acquire_release/16 | 3.74 Melem/s (4.27 µs) | 26.86 Melem/s (595 ns) | ~26.86 Melem/s (595 ns) | 37.62 Melem/s (425 ns) |
+| acquire_release/1  | 1.54 Melem/s (647 ns) | 25.04 Melem/s (39 ns) | 17.89 Melem/s (55.89 ns) | 25.96 Melem/s (38 ns) |
+| acquire_release/4  | 2.67 Melem/s (1.49 µs) | 20.18 Melem/s (198 ns) | 7.38 Melem/s (541.76 ns) | 25.67 Melem/s (155 ns) |
+| acquire_release/16 | 3.74 Melem/s (4.27 µs) | 26.86 Melem/s (595 ns) | 8.54 Melem/s (1.87 µs) | 37.62 Melem/s (425 ns) |
 
 Changes, and why each one helps:
 
