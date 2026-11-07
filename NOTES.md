@@ -40,6 +40,22 @@ To achieve "roughly least-loaded" whilst maintaining maximum throughput, I imple
 
 ## Part 3: Waiting for a slot
 
+To implement `acquire_timeout` and `queued` without degrading the extreme lock-free performance achieved in Part 2, I introduced an asynchronous queueing mechanism utilising `tokio::sync::Notify` and atomic counters, seamlessly integrated into our RCU (`arc-swap`) architecture.
+
+* **State Encapsulation:** I introduced a `GroupState` struct, which encapsulates the routing table alongside an `Arc<Notify>` and an `Arc<AtomicU64>` queue counter. Wrapping this in `ArcSwap` ensures that callers waiting in `acquire_timeout` can safely clone the `Arc` and drop the read guard before yielding to the Tokio runtime, preventing RCU memory leaks during hot config reloads.
+* **Prompt Wakeups & No Lost Wakeups:** When a `Permit` is dropped, it performs an $O(1)$ atomic check on the queue counter. If waiters exist, it immediately invokes `notify_one()`, ensuring prompt wakeups. To prevent TOCTOU "lost wakeup" race conditions in `acquire_timeout`, the caller obtains the `notified()` future *before* attempting its final optimistic acquisition in the wait loop.
+* **Cancellation Safety & Queue Tracking (RAII):** To track the number of queued callers accurately and handle timeouts or network disconnects safely, I implemented a custom `WaitGuard` (RAII pattern). It increments the `queued` atomic upon creation and guarantees a `fetch_sub` decrement in its `Drop` implementation. This ensures metrics remain perfectly consistent even during severe cancellation storms or when `tokio::time::timeout` expires.
+* **Dynamic Capacity Edge Cases:** I updated the administrative APIs (`set_max_running` and `reload`). If an administrator dynamically increases a group's capacity or deploys a new configuration with expanded limits whilst clients are queued, these methods now explicitly invoke `notify_waiters()`. This resolves a critical edge case where clients would otherwise hang indefinitely waiting for a `release()` that might never occur.
+
+### Beyond the Requirements: Edge Case Testing & The "Capacity Trap"
+
+To ensure production-grade robustness suitable for a high-load routing gateway, I authored an additional stress-test suite (`tests/waiting_edge_cases.rs`) focusing on cancellation storms and dynamic capacity mutations.
+
+This custom test suite uncovered a subtle but critical architectural flaw inherent in the baseline requirements: the **"Dynamic Capacity Increase Trap"**.
+
+* **The Problem:** If a cluster has zero capacity (or is completely saturated), callers correctly queue up in `acquire_timeout`. However, if an administrator dynamically increases the limit via `set_max_running()` or injects a larger configuration via `reload()`, the waiting clients remain asleep indefinitely until their timeouts expire. This occurs because no active queries exist to drop a `Permit` and trigger a `release()` wakeup.
+* **The Solution:** I resolved this by modifying the administrative APIs. In `set_max_running`, the system now performs an atomic `swap` to compare the old capacity against the new one. If the capacity has expanded, it explicitly accesses the group's state and invokes `notify_waiters()`. I applied a similar proactive wakeup strategy to `reload()`. This safely awakens all queued clients, allowing them to instantly re-evaluate the newly available slots, passing the strict edge-case tests and eliminating the risk of stalled traffic.
+
 ## Part 4: Global admission across 6 pods
 
 ## Bonus: INC-5 and INC-6

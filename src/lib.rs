@@ -9,6 +9,7 @@
 //! See README.md for the tasks.
 
 use arc_swap::ArcSwap;
+use tokio::sync::Notify;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,66 +120,62 @@ fn pick(candidates: &[Candidate]) -> Option<usize> {
 }
 
 pub struct ClusterPool {
-    // Жодних м'ютексів і локів на читання!
-    groups: ArcSwap<Vec<(String, Vec<Arc<ClusterState>>)>>,
+    groups: ArcSwap<Vec<Arc<GroupState>>>,
 }
 
 impl ClusterPool {
     pub fn new(config: PoolConfig) -> Arc<Self> {
+        let mut initial = Vec::new();
+        for (name, clusters) in &config.groups {
+            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
+            initial.push(Arc::new(GroupState {
+                name: name.clone(),
+                clusters: states,
+                notify: Arc::new(Notify::new()),
+                queued: Arc::new(AtomicU64::new(0)),
+            }));
+        }
         Arc::new(Self {
-            // from_pointee автоматично загортає дані в Arc
-            groups: ArcSwap::from_pointee(build_groups(&config)),
+            groups: ArcSwap::from_pointee(initial),
         })
     }
 
-    // Оновлений метод find (без to_string та cloned)
     fn find(&self, group: &str, cluster: &str) -> Option<Arc<ClusterState>> {
         self.groups
-            .load() // Миттєве lock-free читання!
+            .load()
             .iter()
-            .find(|(name, _)| name == group)
-            .map(|(_, clusters)| clusters)?
+            .find(|g| g.name == group)?
+            .clusters
             .iter()
             .find(|c| c.name == cluster)
             .cloned()
     }
 
-    /// Admit one query to the least-loaded cluster of `group`, or fail fast with `Busy`.
-    // 2. ОПТИМІЗАЦІЯ БАЛАНСУВАННЯ: P2C з fastrand (Zero-allocation, O(1))
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
-        // Guard працює як Arc, але його отримання не блокує інші потоки
-        // і не викликає cache-line bouncing.
-        let groups_guard = self.groups.load();
+        let guard = self.groups.load();
+        let group_state = guard.iter().find(|g| g.name == group).ok_or(AcquireError::UnknownGroup)?;
+        self.acquire_from_group(group_state)
+    }
 
-        let clusters = groups_guard
-            .iter()
-            .find(|(name, _)| name == group)
-            .map(|(_, c)| c)
-            .ok_or(AcquireError::UnknownGroup)?;
-
-        let len = clusters.len();
+    // Виносимо логіку вибору кластера (P2C) в окремий метод
+    fn acquire_from_group(&self, group: &GroupState) -> Result<Permit, AcquireError> {
+        let len = group.clusters.len();
         if len == 0 {
             return Err(AcquireError::Busy);
         }
 
         for _ in 0..3 {
             let state = if len == 1 {
-                &clusters[0]
+                &group.clusters[0]
             } else {
                 let i = fastrand::usize(0..len);
                 let mut j = fastrand::usize(0..len);
                 if i == j {
                     j = (j + 1) % len;
                 }
-
-                let a = &clusters[i];
-                let b = &clusters[j];
-
-                if a.available() >= b.available() {
-                    a
-                } else {
-                    b
-                }
+                let a = &group.clusters[i];
+                let b = &group.clusters[j];
+                if a.available() >= b.available() { a } else { b }
             };
 
             if state.available() == 0 {
@@ -189,21 +186,66 @@ impl ClusterPool {
                 state.admissions.fetch_add(1, Ordering::Relaxed);
                 return Ok(Permit {
                     state: Arc::clone(state),
+                    group_notify: Arc::clone(&group.notify),
+                    group_queued: Arc::clone(&group.queued),
                 });
             }
         }
-
         Err(AcquireError::Busy)
     }
 
-    /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.
     pub async fn acquire_timeout(
         self: &Arc<Self>,
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        let _ = (group, wait);
-        todo!("Part 3")
+        // Клонуємо `Arc<GroupState>`, щоб не тримати `ArcSwapGuard` через `.await` (це заблокує оновлення конфіга)
+        let group_state = {
+            let guard = self.groups.load();
+            guard.iter().find(|g| g.name == group).cloned().ok_or(AcquireError::UnknownGroup)?
+        };
+
+        // 1. Швидкий шлях: можливо, слот уже вільний
+        if let Ok(permit) = self.acquire_from_group(&group_state) {
+            return Ok(permit);
+        }
+
+        // 2. Стаємо в чергу
+        group_state.queued.fetch_add(1, Ordering::Relaxed);
+
+        // RAII Guard: гарантує, що лічильник зменшиться, навіть якщо Future буде скасовано (cancellation)
+        struct WaitGuard {
+            queued: Arc<AtomicU64>,
+        }
+        impl Drop for WaitGuard {
+            fn drop(&mut self) {
+                self.queued.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _wait_guard = WaitGuard {
+            queued: Arc::clone(&group_state.queued),
+        };
+
+        // 3. Чекаємо з таймаутом
+        let wait_fut = tokio::time::timeout(wait, async {
+            loop {
+                // ВАЖЛИВО: Отримуємо future `notified` ДО перевірки наявності слота.
+                // Це повністю унеможливлює стан гонитви (втрачене пробудження).
+                let notified = group_state.notify.notified();
+
+                if let Ok(permit) = self.acquire_from_group(&group_state) {
+                    return permit;
+                }
+
+                // Засинаємо, чекаючи на notify_one() від чийогось Permit::drop
+                notified.await;
+            }
+        });
+
+        match wait_fut.await {
+            Ok(permit) => Ok(permit),
+            Err(_) => Err(AcquireError::Timeout),
+        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -213,8 +255,12 @@ impl ClusterPool {
 
     /// Number of callers currently waiting inside `acquire_timeout` for `group`.
     pub fn queued(&self, group: &str) -> u64 {
-        let _ = group;
-        todo!("Part 3")
+        let guard = self.groups.load();
+        if let Some(g) = guard.iter().find(|g| g.name == group) {
+            g.queued.load(Ordering::Relaxed)
+        } else {
+            0
+        }
     }
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
@@ -227,17 +273,54 @@ impl ClusterPool {
     }
 
     /// Admin API: change a cluster's capacity at runtime.
+    /// fixed after fail test: edge_case_dynamic_capacity_increase_wakes_waiters
     pub fn set_max_running(&self, group: &str, cluster: &str, max_running: u64) {
         if let Some(state) = self.find(group, cluster) {
-            state.max_running.store(max_running, Ordering::Relaxed);
+            let old = state.max_running.swap(max_running, Ordering::Relaxed);
+
+            // Якщо місткість збільшилася, нам треба розбудити тих, хто висить у черзі!
+            if max_running > old {
+                let guard = self.groups.load();
+                if let Some(g) = guard.iter().find(|g| g.name == group) {
+                    // Використовуємо notify_waiters() замість notify_one().
+                    // Адже місткість могла зрости на 10, і якщо ми збудимо лише одного,
+                    // інші 9 слотів будуть простоювати. Ті, кому слота все одно не вистачить,
+                    // просто зроблять спробу і заснуть назад.
+                    g.notify.notify_waiters();
+                }
+            }
         }
     }
 
     /// Bonus: swap in a new config while queries are in flight.
+    /// fixed after fail test: edge_case_dynamic_capacity_increase_wakes_waiters
     pub fn reload(&self, config: PoolConfig) {
-        // Миттєва підміна вказівника. Старий конфіг буде знищено,
-        // коли останній активний читач (Permit) завершить роботу.
-        self.groups.store(Arc::new(build_groups(&config)));
+        let old_guard = self.groups.load();
+
+        let mut existing = std::collections::HashMap::new();
+        for g in old_guard.iter() {
+            existing.insert(g.name.clone(), (Arc::clone(&g.notify), Arc::clone(&g.queued)));
+        }
+
+        let mut new_groups = Vec::new();
+        for (name, clusters) in &config.groups {
+            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
+            let (notify, queued) = existing.remove(name).unwrap_or_else(|| {
+                (Arc::new(Notify::new()), Arc::new(AtomicU64::new(0)))
+            });
+
+            // Оскільки конфіг змінився (можливо, додалися нові кластери або слоти),
+            // про всяк випадок будимо всю чергу, щоб вони побачили нову місткість.
+            notify.notify_waiters();
+
+            new_groups.push(Arc::new(GroupState {
+                name: name.clone(),
+                clusters: states,
+                notify,
+                queued,
+            }));
+        }
+        self.groups.store(Arc::new(new_groups));
     }
 
     /// Bonus: correct a cluster's running counter against the engine's own count.
@@ -254,30 +337,22 @@ impl ClusterPool {
     }
 }
 
-fn build_groups(config: &PoolConfig) -> Vec<(String, Vec<Arc<ClusterState>>)> {
-    config
-        .groups
-        .iter()
-        .map(|(group, clusters)| {
-            let states = clusters
-                .iter()
-                .map(|c| Arc::new(ClusterState::new(c)))
-                .collect();
-            (group.clone(), states)
-        })
-        .collect()
-}
-
 /// Proof of admission. The holder may run one query on `cluster()`.
 pub struct Permit {
-    // Тримаємо стан напряму. Ніяких String і пулів!
     state: Arc<ClusterState>,
+    group_notify: Arc<Notify>,
+    group_queued: Arc<AtomicU64>,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Атомарно, миттєво, без локів!
+        // Звільняємо слот
         self.state.decrement();
+
+        // Якщо в черзі є очікувачі, миттєво будимо одного з них
+        if self.group_queued.load(Ordering::Relaxed) > 0 {
+            self.group_notify.notify_one();
+        }
     }
 }
 
@@ -289,4 +364,12 @@ impl Permit {
     pub fn release(self) {
         drop(self);
     }
+}
+
+#[derive(Debug)]
+struct GroupState {
+    name: String,
+    clusters: Vec<Arc<ClusterState>>,
+    notify: Arc<Notify>,
+    queued: Arc<AtomicU64>,
 }
